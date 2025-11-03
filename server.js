@@ -1,79 +1,188 @@
 // server.js
-const express = require("express");
-const path = require("path");
-const http = require("http");
-const { Server } = require("socket.io");
+require('dotenv').config();
+const cluster = require('cluster');
+const os = require('os');
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const path = require('path');
+const compression = require('compression');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" } // En producción restringe el origen
-});
+const numCPUs = os.cpus().length;
 
-const PORT = process.env.PORT || 3000;
+if (cluster.isMaster) {
+  console.log(`Master ${process.pid} iniciado. Forking ${numCPUs} workers...`);
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
+  }
+  cluster.on('exit', (worker) => {
+    console.log(`Worker ${worker.process.pid} murió. Reiniciando...`);
+    cluster.fork();
+  });
+} else {
+  // Worker: Setup del servidor
+  const app = express();
+  const server = http.createServer(app);
+  const io = socketIo(server, {
+    cors: { origin: '*', methods: ['GET', 'POST'] },
+    pingInterval: 10000,
+    pingTimeout: 5000,
+    maxHttpBufferSize: 1e6, // Límite para payloads grandes (imágenes)
+  });
 
-app.use(express.static(path.join(__dirname, "public")));
+  // Middleware optimizado
+  app.use(compression());
+  app.use(cors());
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.static(path.join(__dirname, 'public'))); // Sirve el HTML/cliente
 
-let players = {}; // { socketId: {id, name, x, y, color, size, lastUpdate} }
+  // Rate limiting para endpoints HTTP (opcional, para APIs)
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 min
+    max: 100, // 100 req por IP
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  app.use('/api/', limiter);
 
-io.on("connection", (socket) => {
-  console.log("Nuevo socket:", socket.id);
+  // Simulación de servidores (datos mock, en prod: lee de DB)
+  const servers = [
+    { id: 1, name: 'EU #1', map: 'Procedimental', playersCur: 45, playersMax: 70, state: 'online', ping: 45, tags: ['PVE', 'PREMIUM'], flags: { A_DIARIO: true, PREMIUM: true }, desc: 'Servidor premium diario.' },
+    { id: 2, name: 'EU #2', map: 'Custom', playersCur: 23, playersMax: 70, state: 'online', ping: 78, tags: ['PVP'], flags: { SEMANAL: true }, desc: 'PvP semanal.' },
+    { id: 3, name: 'EU #3', map: 'Procedimental', playersCur: 67, playersMax: 70, state: 'downloading', ping: 32, tags: ['PVE_ONLY'], flags: { MENSUAL: true }, desc: 'PVE mensual.' },
+    // Agrega más...
+  ];
 
-  // Esperamos que el cliente envíe 'newPlayer' con nombre y datos iniciales
-  socket.on("newPlayer", (payload) => {
-    const p = {
-      id: socket.id,
-      name: (payload && payload.name) || "Anon",
-      x: (payload && payload.x) || Math.random() * 600 + 50,
-      y: (payload && payload.y) || Math.random() * 400 + 50,
-      vx: 0,
-      vy: 0,
-      size: 24,
-      color: payload.color || `hsl(${Math.floor(Math.random()*360)},70%,50%)`,
-      lastUpdate: Date.now()
+  // Estado global por servidor (en prod: usa Redis para escalabilidad)
+  const serverStates = {};
+  servers.forEach(s => {
+    serverStates[s.id] = {
+      players: {}, // {socketId: playerData}
+      bots: {},    // {id: botData}
+      miniBots: {}, // {id: miniBotData}
+      foods: {},   // {id: foodData}
+      playerCounts: {}, // Actualizaciones de counts
     };
-    players[socket.id] = p;
-
-    // enviar a este cliente la lista actual y confirmar
-    socket.emit("currentPlayers", players);
-
-    // notificar al resto que entró uno nuevo
-    socket.broadcast.emit("playerJoined", p);
   });
 
-  // movimiento: cliente envía posición / velocidad
-  socket.on("playerMove", (data) => {
-    if (!players[socket.id]) return;
-    players[socket.id].x = data.x;
-    players[socket.id].y = data.y;
-    players[socket.id].vx = data.vx ?? 0;
-    players[socket.id].vy = data.vy ?? 0;
-    players[socket.id].lastUpdate = Date.now();
-    // opcional: validar límites aquí
-  });
-
-  socket.on("disconnect", () => {
-    console.log("Desconectado:", socket.id);
-    if (players[socket.id]) {
-      delete players[socket.id];
-      socket.broadcast.emit("playerLeft", socket.id);
+  // Generador de bots y foods (simulado)
+  function generateBotsAndFoods(serverId, numBots = 20, numFoods = 100, numMini = 10) {
+    const state = serverStates[serverId];
+    // Bots
+    for (let i = 0; i < numBots; i++) {
+      state.bots[`bot${i}`] = {
+        id: `bot${i}`,
+        name: `Bot-${i}`,
+        x: Math.random() * 4000,
+        y: Math.random() * 4000,
+        radius: 20 + Math.random() * 30,
+        color: `hsl(${Math.random() * 360}, 70%, 55%)`,
+      };
     }
-  });
-});
-
-// Server tick: enviar snapshot a todos cada 50ms (20fps)
-setInterval(() => {
-  // prune jugadores inactivos (opcional)
-  const now = Date.now();
-  for (const id in players) {
-    if (now - players[id].lastUpdate > 60_000) {
-      delete players[id];
-      io.emit("playerLeft", id);
+    // Mini bots
+    for (let i = 0; i < numMini; i++) {
+      state.miniBots[`mini${i}`] = {
+        id: `mini${i}`,
+        name: `Mini-${i}`,
+        x: Math.random() * 4000,
+        y: Math.random() * 4000,
+        radius: 10 + Math.random() * 10,
+        color: `hsl(${Math.random() * 360}, 70%, 55%)`,
+      };
+    }
+    // Foods
+    for (let i = 0; i < numFoods; i++) {
+      state.foods[`food${i}`] = {
+        id: `food${i}`,
+        x: Math.random() * 4000,
+        y: Math.random() * 4000,
+        radius: 5,
+        color: `hsl(${Math.random() * 360}, 70%, 55%)`,
+      };
     }
   }
-  io.emit("state", players);
-}, 50);
+  servers.forEach(s => generateBotsAndFoods(s.id));
 
-server.listen(PORT, () => {
-  console.log(`Servidor corriendo en puerto ${PORT}`);
-});
+  // Socket events
+  io.on('connection', (socket) => {
+    console.log(`Cliente conectado: ${socket.id}`);
+
+    // Envía lista de servidores
+    socket.on('getServers', () => {
+      socket.emit('servers', servers);
+    });
+
+    // Únete a un servidor
+    socket.on('joinServer', ({ serverId, playerData }) => {
+      if (!serverStates[serverId]) return socket.disconnect();
+      const state = serverStates[serverId];
+      state.players[socket.id] = { ...playerData, id: socket.id, x: Math.random() * 4000, y: Math.random() * 4000 };
+      socket.join(`server_${serverId}`); // Room para broadcasts
+      socket.emit('state', state); // Envía estado inicial
+      io.to(`server_${serverId}`).emit('playerCountUpdate', { [serverId]: Object.keys(state.players).length });
+    });
+
+    // Movimiento del jugador
+    socket.on('move', (dir) => {
+      const player = serverStates[currentServerId]?.players[socket.id]; // Asume currentServerId tracked
+      if (player) {
+        player.x += dir.x * player.speed;
+        player.y += dir.y * player.speed;
+        // Wrap around world
+        if (player.x < 0) player.x += 4000;
+        if (player.x > 4000) player.x -= 4000;
+        if (player.y < 0) player.y += 4000;
+        if (player.y > 4000) player.y -= 4000;
+      }
+    });
+
+    // Chat
+    socket.on('chat', (text) => {
+      io.to(`server_${currentServerId}`).emit('chat', { sender: player.name, text });
+    });
+
+    // Actualiza jugador (skins, points, etc.)
+    socket.on('updatePlayer', (updates) => {
+      const player = serverStates[currentServerId]?.players[socket.id];
+      if (player) {
+        Object.assign(player, updates);
+        // Broadcast update a room
+        socket.to(`server_${currentServerId}`).emit('playerUpdate', { id: socket.id, ...updates });
+      }
+    });
+
+    // Simula updates de estado cada 50ms (optimizado: solo delta changes en prod)
+    const interval = setInterval(() => {
+      if (currentServerId) {
+        // Simula movimiento de bots/foods (en prod: physics engine)
+        Object.values(serverStates[currentServerId].bots).forEach(bot => {
+          bot.x += (Math.random() - 0.5) * 2;
+          bot.y += (Math.random() - 0.5) * 2;
+        });
+        socket.emit('state', serverStates[currentServerId]);
+      }
+    }, 50);
+
+    socket.on('disconnect', () => {
+      // Limpia jugador
+      if (currentServerId) {
+        delete serverStates[currentServerId].players[socket.id];
+        io.to(`server_${currentServerId}`).emit('playerCountUpdate', { [currentServerId]: Object.keys(serverStates[currentServerId].players).length });
+      }
+      clearInterval(interval);
+      console.log(`Cliente desconectado: ${socket.id}`);
+    });
+  });
+
+  // Ruta para servir el cliente HTML
+  app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html')); // Asume HTML en /public
+  });
+
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => {
+    console.log(`Worker ${process.pid} escuchando en puerto ${PORT}`);
+  });
+    }
